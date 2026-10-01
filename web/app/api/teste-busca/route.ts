@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createQuery, Passengers, getFlights } from "fast-flights-ts";
+import { createQuery, Passengers, getFlights, SingleFlight } from "fast-flights-ts";
 
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
-function contarParadas(segments: any[], destino: string): number {
+function contarParadas(segments: readonly SingleFlight[], destino: string): number {
   let i = 0;
   let ida = 0;
   while (i < segments.length && segments[i].to_airport.code !== destino) {
