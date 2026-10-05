@@ -1,0 +1,33 @@
+name: Monitor diario
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      alvo:
+        description: "Alvo de teste em reais por pessoa (deixe vazio no uso normal)"
+        required: false
+        default: ""
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Rodar monitor
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_DESTINO: ${{ secrets.EMAIL_DESTINO }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          ALVO_TESTE: ${{ inputs.alvo }}
+        run: |
+          if [ -n "$ALVO_TESTE" ]; then
+            node monitor.mjs --salvar --alertar --alvo "$ALVO_TESTE"
+          else
+            node monitor.mjs --salvar --alertar
+          fi
