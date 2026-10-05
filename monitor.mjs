@@ -6,10 +6,10 @@ import { Resend } from "resend";
 // --- Configuração (edite aqui) ---
 const CONFIG = {
   origens: ["GRU", "VCP"], // CGH pode ser testado depois
-  destinos: ["MCO", "SFB", "MLB", "FLL", "MIA", "TPA"],
+  destinos: ["MCO", "FLL", "MIA", "TPA"],
   primeiraSaida: "2026-12-01",
-  ultimaSaida: "2027-01-10",
-  passoDias: 5,
+  ultimaSaida: "2027-02-01",
+  passoDias: 1,
   duracaoDias: 14,
   adultos: 4,
   criancas: 0,
@@ -543,6 +543,11 @@ function imprimirTabelaTop10(opcoes) {
 const inicio = Date.now();
 const todasCombinacoes = gerarCombinacoes();
 const combinacoes = modoTeste ? todasCombinacoes.slice(0, 3) : todasCombinacoes;
+
+const numOrigens = CONFIG.origens.length;
+const numDestinos = CONFIG.destinos.length;
+const numDatas = gerarDatasIda().length;
+console.log(`Combinações: ${todasCombinacoes.length} (${numOrigens} origens x ${numDestinos} destinos x ${numDatas} datas)`);
 
 const extraVerificacao = verificarPreco ? " (+ verificação --verificar)" : "";
 console.log(
