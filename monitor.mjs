@@ -1,11 +1,12 @@
 import { writeFileSync } from "node:fs";
 import { createClient } from "@supabase/supabase-js";
 import { createQuery, Passengers, getFlights } from "fast-flights-ts";
+import { Resend } from "resend";
 
 // --- Configuração (edite aqui) ---
 const CONFIG = {
-  origens: ["GRU", "VCP"],
-  destinos: ["MCO"],
+  origens: ["GRU", "VCP"], // CGH pode ser testado depois
+  destinos: ["MCO", "SFB", "MLB", "FLL", "MIA", "TPA"],
   primeiraSaida: "2026-12-01",
   ultimaSaida: "2027-01-10",
   passoDias: 5,
@@ -25,12 +26,22 @@ const CONFIG = {
 const modoTeste = process.argv.includes("--teste");
 const salvarSupabase = process.argv.includes("--salvar");
 const verificarPreco = process.argv.includes("--verificar");
+const alertar = process.argv.includes("--alertar");
+
+// Extrair --alvo N se fornecido
+const alvoIdx = process.argv.indexOf("--alvo");
+const alvoOverride = alvoIdx !== -1 && alvoIdx + 1 < process.argv.length
+  ? Number(process.argv[alvoIdx + 1])
+  : null;
+const precoAlvoAtual = alvoOverride ?? CONFIG.precoAlvoPorPessoa;
 
 const PAUSA_RETRY_MS = 10_000;
 
 let buscasOk = 0;
 let buscasFalha = 0;
 let opcoesDescartadasTotal = 0;
+let falhasSeguidas = 0;
+let interrompidoPorFalhas = false;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -119,6 +130,7 @@ async function buscarComRetry(query, rotulo) {
     }
   }
   buscasFalha += 1;
+  falhasSeguidas += 1;
   throw ultimoErro;
 }
 
@@ -246,7 +258,7 @@ function voosParaOpcoes(combo, results, tipoPreco) {
       duracaoTexto: formatarDuracao(duracaoMin),
       precoApi,
       precoPorPessoa: precoPorPessoaArred,
-      abaixoDoAlvo: precoPorPessoaArred < CONFIG.precoAlvoPorPessoa,
+      abaixoDoAlvo: precoPorPessoaArred < precoAlvoAtual,
     };
   });
 
@@ -267,7 +279,7 @@ function filtrarOpcoesValidas(opcoes) {
       descartadas += 1;
       continue;
     }
-    o.abaixoDoAlvo = o.precoPorPessoa < CONFIG.precoAlvoPorPessoa;
+    o.abaixoDoAlvo = o.precoPorPessoa < precoAlvoAtual;
     validas.push(o);
   }
 
@@ -330,6 +342,183 @@ async function gravarPrecosNoSupabase(opcoes) {
   }
 
   return { gravadas, falhou: false };
+}
+
+/** Chave única para identificar uma viagem (origem|destino|data_ida|data_volta). */
+function chaveViagem(opcao) {
+  return `${opcao.origem}|${opcao.destino}|${opcao.dataIda}|${opcao.dataVolta}`;
+}
+
+/** Busca alertas anteriores no Supabase para as viagens fornecidas. */
+async function buscarAlertasAnteriores(viagens) {
+  const url = process.env.SUPABASE_URL?.trim();
+  const chave = process.env.SUPABASE_SECRET_KEY?.trim();
+
+  if (!url || !chave) {
+    console.error("\nNão foi possível consultar alertas: faltam SUPABASE_URL e/ou SUPABASE_SECRET_KEY.");
+    return {};
+  }
+
+  const supabase = createClient(url, chave);
+  const chaves = viagens.map(chaveViagem);
+
+  const { data, error } = await supabase
+    .from("alertas")
+    .select("*")
+    .in("chave", chaves);
+
+  if (error) {
+    console.error("Erro ao buscar alertas anteriores:", error.message);
+    return {};
+  }
+
+  // Mapa: chave -> último preço avisado
+  const mapa = {};
+  for (const alerta of data ?? []) {
+    mapa[alerta.chave] = alerta.preco_por_pessoa;
+  }
+  return mapa;
+}
+
+/** Filtra viagens que precisam de alerta (abaixo do alvo e não avisadas ou preço menor). */
+function filtrarViagensParaAlertar(opcoes, alertasAnteriores, alvo) {
+  const abaixoDoAlvo = opcoes.filter(o => o.precoPorPessoa < alvo);
+  
+  // Para cada viagem, ficar só com a opção mais barata
+  const porViagem = {};
+  for (const o of abaixoDoAlvo) {
+    const chave = chaveViagem(o);
+    if (!porViagem[chave] || o.precoPorPessoa < porViagem[chave].precoPorPessoa) {
+      porViagem[chave] = o;
+    }
+  }
+
+  const melhores = Object.values(porViagem);
+  const paraAlertar = [];
+
+  for (const o of melhores) {
+    const chave = chaveViagem(o);
+    const ultimoPreco = alertasAnteriores[chave];
+    
+    // Nunca avisado ou preço pelo menos R$ 50 menor
+    if (ultimoPreco === undefined || o.precoPorPessoa <= ultimoPreco - 50) {
+      paraAlertar.push(o);
+    }
+  }
+
+  return paraAlertar.sort((a, b) => a.precoPorPessoa - b.precoPorPessoa);
+}
+
+/** Gera link do Google Flights para a viagem. */
+function gerarLinkGoogleFlights(opcao) {
+  const q = `Flights%20to%20${opcao.destino}%20from%20${opcao.origem}%20on%20${opcao.dataIda}%20through%20${opcao.dataVolta}`;
+  return `https://www.google.com/travel/flights?q=${q}`;
+}
+
+/** Envia e-mail de alerta com as viagens encontradas. */
+async function enviarEmailAlerta(viagens, alvo) {
+  const apiKey = process.env.RESEND_API_KEY?.trim();
+  const destino = process.env.EMAIL_DESTINO?.trim();
+
+  if (!apiKey || !destino) {
+    console.error("\nNão foi possível enviar alerta: faltam RESEND_API_KEY e/ou EMAIL_DESTINO.");
+    return { enviado: false, erro: "faltam variáveis de ambiente" };
+  }
+
+  const resend = new Resend(apiKey);
+  const top10 = viagens.slice(0, 10);
+  
+  // Assunto com a primeira viagem mais barata
+  const primeira = top10[0];
+  const assunto = `✈️ Passagem abaixo de R$ ${alvo.toFixed(0)} por pessoa: ${primeira.origem}→${primeira.destino} R$ ${primeira.precoPorPessoa.toFixed(0)}`;
+
+  let corpo = "Encontrei passagens abaixo do seu alvo de preço:\n\n";
+  for (const v of top10) {
+    const link = gerarLinkGoogleFlights(v);
+    corpo += `${v.origem} → ${v.destino}\n`;
+    corpo += `  Ida: ${v.dataIda} | Volta: ${v.dataVolta}\n`;
+    corpo += `  Companhias: ${v.companhias.join(", ")}\n`;
+    corpo += `  Paradas: ${v.paradas} | Duração: ${v.duracaoTexto}\n`;
+    corpo += `  Preço por pessoa: R$ ${v.precoPorPessoa.toFixed(2)}\n`;
+    corpo += `  Total para ${CONFIG.adultos} adultos: R$ ${(v.precoPorPessoa * CONFIG.adultos).toFixed(2)}\n`;
+    corpo += `  ${link}\n\n`;
+  }
+
+  corpo += "Bons voos! 🛫";
+
+  const { data, error } = await resend.emails.send({
+    from: "Monitor de Passagens <onboarding@resend.dev>",
+    to: destino,
+    subject: assunto,
+    text: corpo,
+  });
+
+  if (error) {
+    console.error("Erro ao enviar e-mail de alerta:", error.message);
+    return { enviado: false, erro: error.message };
+  }
+
+  console.log(`\n✅ E-mail de alerta enviado para ${destino} (ID: ${data.id})`);
+  return { enviado: true, id: data.id };
+}
+
+/** Grava alertas na tabela alertas do Supabase. */
+async function gravarAlertasNoSupabase(viagens) {
+  const url = process.env.SUPABASE_URL?.trim();
+  const chave = process.env.SUPABASE_SECRET_KEY?.trim();
+
+  if (!url || !chave) {
+    console.error("\nNão foi possível gravar alertas: faltam SUPABASE_URL e/ou SUPABASE_SECRET_KEY.");
+    return { gravadas: 0, falhou: true };
+  }
+
+  const supabase = createClient(url, chave);
+  const linhas = viagens.map(o => ({
+    chave: chaveViagem(o),
+    origem: o.origem,
+    destino: o.destino,
+    data_ida: o.dataIda,
+    data_volta: o.dataVolta,
+    companhias: o.companhias.join(", "),
+    preco_por_pessoa: o.precoPorPessoa,
+    preco_total: o.precoApi,
+  }));
+
+  const { error } = await supabase.from("alertas").insert(linhas);
+
+  if (error) {
+    console.error("Erro ao gravar alertas:", error.message);
+    return { gravadas: 0, falhou: true };
+  }
+
+  console.log(`Alertas gravados: ${linhas.length} viagem(ns)`);
+  return { gravadas: linhas.length, falhou: false };
+}
+
+/** Envia e-mail de falha quando --alertar está ativo. */
+async function enviarEmailFalha(motivo) {
+  const apiKey = process.env.RESEND_API_KEY?.trim();
+  const destino = process.env.EMAIL_DESTINO?.trim();
+
+  if (!apiKey || !destino) {
+    console.error("\nNão foi possível enviar aviso de falha: faltam RESEND_API_KEY e/ou EMAIL_DESTINO.");
+    return;
+  }
+
+  const resend = new Resend(apiKey);
+
+  const { error } = await resend.emails.send({
+    from: "Monitor de Passagens <onboarding@resend.dev>",
+    to: destino,
+    subject: "O monitor de passagens teve problemas hoje",
+    text: `O monitor de passagens teve problemas hoje.\n\nMotivo: ${motivo}\n\nVerifique os logs para mais detalhes.`,
+  });
+
+  if (error) {
+    console.error("Erro ao enviar e-mail de falha:", error.message);
+  } else {
+    console.log("\n✅ E-mail de falha enviado.");
+  }
 }
 
 function imprimirTabelaTop10(opcoes) {
@@ -401,6 +590,7 @@ for (let i = 0; i < combinacoes.length; i++) {
 
   try {
     const results = await buscarComRetry(query, rotulo);
+    falhasSeguidas = 0; // Reset contador de falhas seguidas
     const opcoes = voosParaOpcoes(combo, results, tipoPreco);
     todasOpcoes.push(...opcoes);
     const descartadasNesta =
@@ -412,6 +602,13 @@ for (let i = 0; i < combinacoes.length; i++) {
     const msg = { combo, erro: `${err.name}: ${err.message}` };
     erros.push(msg);
     console.log(`  → ERRO (seguindo): ${msg.erro}`);
+    
+    // Interromper se 8 falhas seguidas
+    if (falhasSeguidas >= 8) {
+      interrompidoPorFalhas = true;
+      console.log(`\n⛔ Interrompendo varredura: ${falhasSeguidas} falhas seguidas detectadas.`);
+      break;
+    }
   }
 
   if (i < combinacoes.length - 1) {
@@ -429,6 +626,9 @@ console.log(`  Buscas com falha:   ${buscasFalha}`);
 console.log(`  Tempo total:        ${tempoTotalSeg}s`);
 console.log(`  Opções válidas:     ${todasOpcoes.length}`);
 console.log(`  Opções descartadas por preço inválido: ${opcoesDescartadasTotal}`);
+if (interrompidoPorFalhas) {
+  console.log(`  ⚠ Varredura interrompida por falhas seguidas`);
+}
 
 const payload = {
   config: CONFIG,
@@ -459,6 +659,36 @@ if (salvarSupabase) {
       console.log(`\nSupabase: ${gravadas} linha(s) gravada(s) na tabela precos.`);
     } else {
       console.log(`\nSupabase: gravação incompleta — ${gravadas} linha(s) gravada(s) antes do erro.`);
+    }
+  }
+}
+
+// --- Sistema de alertas ---
+if (alertar) {
+  // Verificar falhas críticas
+  if (interrompidoPorFalhas) {
+    await enviarEmailFalha("Varredura interrompida por 8 falhas seguidas");
+    process.exit(1);
+  }
+  
+  if (buscasOk === 0) {
+    await enviarEmailFalha("Nenhuma busca deu sucesso");
+    process.exit(1);
+  }
+  
+  // Filtrar viagens abaixo do alvo
+  const alertasAnteriores = await buscarAlertasAnteriores(todasOpcoes);
+  const viagensParaAlertar = filtrarViagensParaAlertar(todasOpcoes, alertasAnteriores, precoAlvoAtual);
+  
+  if (viagensParaAlertar.length === 0) {
+    console.log("\nNenhuma viagem abaixo do alvo para alertar.");
+  } else {
+    console.log(`\n=== ${viagensParaAlertar.length} viagem(ns) para alertar ===`);
+    const { enviado } = await enviarEmailAlerta(viagensParaAlertar, precoAlvoAtual);
+    
+    // Só gravar alertas se e-mail foi enviado com sucesso E --alvo NÃO foi usado
+    if (enviado && alvoOverride === null) {
+      await gravarAlertasNoSupabase(viagensParaAlertar);
     }
   }
 }
