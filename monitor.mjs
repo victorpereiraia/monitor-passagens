@@ -35,6 +35,25 @@ const alvoOverride = alvoIdx !== -1 && alvoIdx + 1 < process.argv.length
   : null;
 const precoAlvoAtual = alvoOverride ?? CONFIG.precoAlvoPorPessoa;
 
+// Extrair --destino XXX se fornecido
+const destinoIdx = process.argv.indexOf("--destino");
+const destinoOverride = destinoIdx !== -1 && destinoIdx + 1 < process.argv.length
+  ? process.argv[destinoIdx + 1]
+  : null;
+
+// Validar e aplicar --destino
+let destinosAtuais = CONFIG.destinos;
+let destinoSufixo = "";
+if (destinoOverride) {
+  if (!CONFIG.destinos.includes(destinoOverride)) {
+    console.error(`Erro: destino "${destinoOverride}" não está na lista de destinos do CONFIG.`);
+    console.error(`Destinos válidos: ${CONFIG.destinos.join(", ")}`);
+    process.exit(1);
+  }
+  destinosAtuais = [destinoOverride];
+  destinoSufixo = `[${destinoOverride}] `;
+}
+
 const PAUSA_RETRY_MS = 10_000;
 
 let buscasOk = 0;
@@ -67,7 +86,7 @@ function gerarDatasIda() {
 function gerarCombinacoes() {
   const combos = [];
   for (const origem of CONFIG.origens) {
-    for (const destino of CONFIG.destinos) {
+    for (const destino of destinosAtuais) {
       for (const dataIda of gerarDatasIda()) {
         combos.push({
           origem,
@@ -362,10 +381,14 @@ async function buscarAlertasAnteriores(viagens) {
   const supabase = createClient(url, chave);
   const chaves = viagens.map(chaveViagem);
 
-  const { data, error } = await supabase
-    .from("alertas")
-    .select("*")
-    .in("chave", chaves);
+  let query = supabase.from("alertas").select("*").in("chave", chaves);
+  
+  // Filtrar por destino atual quando --destino foi usado
+  if (destinoOverride) {
+    query = query.eq("destino", destinoOverride);
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     console.error("Erro ao buscar alertas anteriores:", error.message);
@@ -430,9 +453,9 @@ async function enviarEmailAlerta(viagens, alvo) {
   
   // Assunto com a primeira viagem mais barata
   const primeira = top10[0];
-  const assunto = `✈️ Passagem abaixo de R$ ${alvo.toFixed(0)} por pessoa: ${primeira.origem}→${primeira.destino} R$ ${primeira.precoPorPessoa.toFixed(0)}`;
+  const assunto = `${destinoSufixo}✈️ Passagem abaixo de R$ ${alvo.toFixed(0)} por pessoa: ${primeira.origem}→${primeira.destino} R$ ${primeira.precoPorPessoa.toFixed(0)}`;
 
-  let corpo = "Encontrei passagens abaixo do seu alvo de preço:\n\n";
+  let corpo = `${destinoSufixo}Encontrei passagens abaixo do seu alvo de preço:\n\n`;
   for (const v of top10) {
     const link = gerarLinkGoogleFlights(v);
     corpo += `${v.origem} → ${v.destino}\n`;
@@ -510,8 +533,8 @@ async function enviarEmailFalha(motivo) {
   const { error } = await resend.emails.send({
     from: "Monitor de Passagens <onboarding@resend.dev>",
     to: destino,
-    subject: "O monitor de passagens teve problemas hoje",
-    text: `O monitor de passagens teve problemas hoje.\n\nMotivo: ${motivo}\n\nVerifique os logs para mais detalhes.`,
+    subject: `${destinoSufixo}O monitor de passagens teve problemas hoje`,
+    text: `${destinoSufixo}O monitor de passagens teve problemas hoje.\n\nMotivo: ${motivo}\n\nVerifique os logs para mais detalhes.`,
   });
 
   if (error) {
@@ -545,7 +568,7 @@ const todasCombinacoes = gerarCombinacoes();
 const combinacoes = modoTeste ? todasCombinacoes.slice(0, 3) : todasCombinacoes;
 
 const numOrigens = CONFIG.origens.length;
-const numDestinos = CONFIG.destinos.length;
+const numDestinos = destinosAtuais.length;
 const numDatas = gerarDatasIda().length;
 console.log(`Combinações: ${todasCombinacoes.length} (${numOrigens} origens x ${numDestinos} destinos x ${numDatas} datas)`);
 
