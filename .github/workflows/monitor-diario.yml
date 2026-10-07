@@ -1,7 +1,7 @@
 name: Monitor diario
 on:
   schedule:
-    - cron: "17 11 * * *"
+    - cron: "17 5 * * *"
   workflow_dispatch:
     inputs:
       alvo:
