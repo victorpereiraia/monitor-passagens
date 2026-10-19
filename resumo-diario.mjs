@@ -10,6 +10,11 @@ const horas = horasIdx !== -1 && horasIdx + 1 < process.argv.length
   ? Number(process.argv[horasIdx + 1])
   : 3;
 
+// --ignorar-quedas: deixa de fora viagens cuja queda em relação aos últimos dias parece erro de coleta
+const ignorarQuedas = process.argv.includes("--ignorar-quedas");
+const QUEDA_SUSPEITA = 0.5;
+const DIAS_HISTORICO_SANIDADE = 3;
+
 const url = process.env.SUPABASE_URL?.trim();
 const chave = process.env.SUPABASE_SECRET_KEY?.trim();
 const resendApiKey = process.env.RESEND_API_KEY?.trim();
@@ -99,20 +104,68 @@ async function buscarMenorPrecoColetaAnterior() {
   return data.preco_por_pessoa;
 }
 
-/** Busca menor preço histórico de toda a tabela. */
-async function buscarMenorPrecoHistorico() {
+/** Busca menor preço histórico de toda a tabela, ignorando os ids informados. */
+async function buscarMenorPrecoHistorico(idsIgnorados = new Set()) {
   const { data, error } = await supabase
     .from("precos")
-    .select("preco_por_pessoa")
+    .select("id, preco_por_pessoa")
     .order("preco_por_pessoa", { ascending: true })
-    .limit(1)
-    .single();
-  
+    .limit(idsIgnorados.size + 1);
+
   if (error || !data) {
     return null;
   }
-  
-  return data.preco_por_pessoa;
+
+  const valido = data.find((r) => !idsIgnorados.has(r.id));
+  return valido ? valido.preco_por_pessoa : null;
+}
+
+function chaveViagem(r) {
+  return `${r.origem}|${r.destino}|${r.data_ida}|${r.data_volta}`;
+}
+
+/** Separa as coletas de hoje cujo menor preço caiu mais que QUEDA_SUSPEITA vs os últimos dias. */
+async function separarQuedasSuspeitas(coletas) {
+  const desde = new Date(inicioHoje.getTime() - DIAS_HISTORICO_SANIDADE * 24 * 60 * 60 * 1000).toISOString();
+  const anteriores = {};
+
+  for (let offset = 0; ; offset += 1000) {
+    const { data, error } = await supabase
+      .from("precos")
+      .select("origem, destino, data_ida, data_volta, preco_por_pessoa")
+      .gte("coletado_em", desde)
+      .lt("coletado_em", inicioHojeISO)
+      .order("id", { ascending: true })
+      .range(offset, offset + 999);
+
+    if (error) {
+      console.error("Erro ao buscar histórico para checagem de quedas:", error.message);
+      return { validas: coletas, suspeitas: [] };
+    }
+
+    for (const r of data) {
+      const k = chaveViagem(r);
+      if (anteriores[k] === undefined || r.preco_por_pessoa < anteriores[k]) anteriores[k] = r.preco_por_pessoa;
+    }
+    if (data.length < 1000) break;
+  }
+
+  const minimoHoje = {};
+  for (const c of coletas) {
+    const k = chaveViagem(c);
+    if (minimoHoje[k] === undefined || c.preco_por_pessoa < minimoHoje[k]) minimoHoje[k] = c.preco_por_pessoa;
+  }
+
+  const chavesSuspeitas = new Set(
+    Object.keys(minimoHoje).filter(
+      (k) => anteriores[k] !== undefined && minimoHoje[k] < anteriores[k] * (1 - QUEDA_SUSPEITA),
+    ),
+  );
+
+  return {
+    validas: coletas.filter((c) => !chavesSuspeitas.has(chaveViagem(c))),
+    suspeitas: coletas.filter((c) => chavesSuspeitas.has(chaveViagem(c))),
+  };
 }
 
 /** Menor preço por destino nas coletas de hoje. */
@@ -153,7 +206,15 @@ function formatarDiferenca(precoAtual, precoAnterior) {
 // --- Execução principal ---
 console.log(`Buscando coletas das últimas ${horas} horas...`);
 
-const coletasHoje = await buscarColetasHoje();
+let coletasHoje = await buscarColetasHoje();
+let coletasSuspeitas = [];
+
+if (ignorarQuedas && coletasHoje?.length) {
+  const { validas, suspeitas } = await separarQuedasSuspeitas(coletasHoje);
+  coletasHoje = validas;
+  coletasSuspeitas = suspeitas;
+  console.log(`Ignorando ${suspeitas.length} coleta(s) com queda suspeita.`);
+}
 
 if (!coletasHoje || coletasHoje.length === 0) {
   console.log("Nenhuma coleta encontrada hoje. Enviando e-mail de aviso...");
@@ -189,7 +250,7 @@ const contagensPorDestino = await contarLinhasPorDestino();
 const menorPrecoAnterior = await buscarMenorPrecoColetaAnterior();
 
 // Menor preço histórico
-const menorPrecoHistorico = await buscarMenorPrecoHistorico();
+const menorPrecoHistorico = await buscarMenorPrecoHistorico(new Set(coletasSuspeitas.map((c) => c.id)));
 
 // Montar e-mail
 const menorHoje = top5[0];
@@ -266,9 +327,15 @@ for (const destino of DESTINOS) {
 }
 corpo += partes.join(", ") + "\n";
 
+if (coletasSuspeitas.length > 0) {
+  const viagensIgnoradas = [...new Set(coletasSuspeitas.map((c) => `${c.origem}→${c.destino} ida ${c.data_ida}`))];
+  corpo += `\n⚠️ Ignoradas por queda suspeita (provável erro de coleta): ${viagensIgnoradas.join("; ")}\n`;
+}
+
 // Enviar e-mail
 const assunto = `✈️ Resumo do dia: menor preço R$ ${menorHoje.preco_por_pessoa.toFixed(0)} por pessoa (${menorHoje.origem}→${menorHoje.destino})`;
 
+console.log(`\n${assunto}\n\n${corpo}`);
 console.log("Enviando e-mail de resumo...");
 
 const { error } = await resend.emails.send({

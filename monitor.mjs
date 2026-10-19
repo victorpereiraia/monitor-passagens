@@ -19,6 +19,9 @@ const CONFIG = {
   pausaMs: 4000,
   precoAlvoPorPessoa: 2700,
   precoMinimoPorPessoa: 500,
+  /** Queda acima disso em relação ao menor preço recente da mesma viagem dispara nova busca de confirmação. */
+  quedaSuspeita: 0.5,
+  diasHistoricoSanidade: 3,
   /** Se true, divide o preço da API pelo número de adultos (total do grupo). */
   precoEhTotalDoGrupo: true,
 };
@@ -379,28 +382,147 @@ async function buscarAlertasAnteriores(viagens) {
   }
 
   const supabase = createClient(url, chave);
-  const chaves = viagens.map(chaveViagem);
+  const datasIda = [...new Set(viagens.map((v) => v.dataIda))];
 
-  let query = supabase.from("alertas").select("*").in("chave", chaves);
-  
-  // Filtrar por destino atual quando --destino foi usado
-  if (destinoOverride) {
-    query = query.eq("destino", destinoOverride);
-  }
-
-  const { data, error } = await query;
+  // A tabela alertas não tem coluna "chave": filtra por destino/data e monta a chave aqui
+  const { data, error } = await supabase
+    .from("alertas")
+    .select("origem, destino, data_ida, data_volta, preco_por_pessoa")
+    .in("destino", destinosAtuais)
+    .in("data_ida", datasIda)
+    .order("enviado_em", { ascending: true });
 
   if (error) {
     console.error("Erro ao buscar alertas anteriores:", error.message);
     return {};
   }
 
-  // Mapa: chave -> último preço avisado
+  // Mapa: chave -> último preço avisado (ordem crescente, o mais recente sobrescreve)
   const mapa = {};
   for (const alerta of data ?? []) {
-    mapa[alerta.chave] = alerta.preco_por_pessoa;
+    const chaveAlerta = chaveViagem({
+      origem: alerta.origem,
+      destino: alerta.destino,
+      dataIda: alerta.data_ida,
+      dataVolta: alerta.data_volta,
+    });
+    mapa[chaveAlerta] = Number(alerta.preco_por_pessoa);
   }
   return mapa;
+}
+
+/** Menor preço por pessoa de cada viagem nas coletas dos últimos dias (antes desta execução). */
+async function buscarMenoresPrecosRecentes() {
+  const url = process.env.SUPABASE_URL?.trim();
+  const chave = process.env.SUPABASE_SECRET_KEY?.trim();
+
+  if (!url || !chave) {
+    console.log("\nChecagem de sanidade pulada: faltam SUPABASE_URL e/ou SUPABASE_SECRET_KEY.");
+    return null;
+  }
+
+  const supabase = createClient(url, chave);
+  const desde = new Date(inicio - CONFIG.diasHistoricoSanidade * 24 * 60 * 60 * 1000).toISOString();
+  const ate = new Date(inicio).toISOString();
+  const mapa = {};
+  const tamanhoPagina = 1000;
+
+  for (let offset = 0; ; offset += tamanhoPagina) {
+    const { data, error } = await supabase
+      .from("precos")
+      .select("origem, destino, data_ida, data_volta, preco_por_pessoa")
+      .in("destino", destinosAtuais)
+      .gte("coletado_em", desde)
+      .lt("coletado_em", ate)
+      .order("id", { ascending: true })
+      .range(offset, offset + tamanhoPagina - 1);
+
+    if (error) {
+      console.error("Erro ao buscar histórico para checagem de sanidade:", error.message);
+      return null;
+    }
+
+    for (const r of data) {
+      const chaveHist = chaveViagem({
+        origem: r.origem,
+        destino: r.destino,
+        dataIda: r.data_ida,
+        dataVolta: r.data_volta,
+      });
+      const preco = Number(r.preco_por_pessoa);
+      if (mapa[chaveHist] === undefined || preco < mapa[chaveHist]) {
+        mapa[chaveHist] = preco;
+      }
+    }
+
+    if (data.length < tamanhoPagina) break;
+  }
+
+  return mapa;
+}
+
+/**
+ * Viagens cujo menor preço caiu mais que CONFIG.quedaSuspeita em relação ao histórico
+ * recente são buscadas de novo. Se a nova busca não confirmar a queda, as opções
+ * suspeitas são trocadas pelas da nova busca; se a nova busca falhar, são descartadas.
+ */
+async function revalidarQuedasSuspeitas(opcoes) {
+  const historico = await buscarMenoresPrecosRecentes();
+  if (!historico) return { opcoes, suspeitas: 0, corrigidas: 0, confirmadas: 0 };
+
+  const porViagem = {};
+  for (const o of opcoes) {
+    (porViagem[chaveViagem(o)] ??= []).push(o);
+  }
+
+  let suspeitas = 0;
+  let corrigidas = 0;
+  let confirmadas = 0;
+  const resultado = [];
+
+  for (const [chave, doTrecho] of Object.entries(porViagem)) {
+    const minimoAtual = Math.min(...doTrecho.map((o) => o.precoPorPessoa));
+    const minimoAnterior = historico[chave];
+
+    if (minimoAnterior === undefined || minimoAtual >= minimoAnterior * (1 - CONFIG.quedaSuspeita)) {
+      resultado.push(...doTrecho);
+      continue;
+    }
+
+    suspeitas += 1;
+    const { origem, destino, dataIda, dataVolta } = doTrecho[0];
+    const combo = { origem, destino, dataIda, dataVolta };
+    console.log(
+      `\n⚠ Queda suspeita ${origem}→${destino} ida ${dataIda}: R$ ${minimoAtual.toFixed(0)} hoje vs ` +
+        `R$ ${minimoAnterior.toFixed(0)} nos últimos ${CONFIG.diasHistoricoSanidade} dias. Buscando de novo...`,
+    );
+
+    await sleep(CONFIG.pausaMs);
+    try {
+      const query = montarQuery(
+        combo,
+        criarPassageiros({ adultos: CONFIG.adultos, criancas: CONFIG.criancas, bebes: CONFIG.bebes }),
+      );
+      const novas = voosParaOpcoes(combo, await buscarComRetry(query, `revalidação ${origem}→${destino} ${dataIda}`), tipoPreco);
+      const novoMinimo = novas.length ? Math.min(...novas.map((o) => o.precoPorPessoa)) : null;
+
+      if (novoMinimo !== null && novoMinimo < minimoAnterior * (1 - CONFIG.quedaSuspeita)) {
+        confirmadas += 1;
+        console.log(`  → Confirmada: nova busca trouxe R$ ${novoMinimo.toFixed(0)}.`);
+      } else {
+        corrigidas += 1;
+        console.log(
+          `  → Não confirmada: nova busca trouxe ${novoMinimo !== null ? `R$ ${novoMinimo.toFixed(0)}` : "nenhuma opção"}. Usando a nova busca.`,
+        );
+      }
+      resultado.push(...novas);
+    } catch (err) {
+      corrigidas += 1;
+      console.log(`  → Nova busca falhou (${err.message}). Opções suspeitas descartadas.`);
+    }
+  }
+
+  return { opcoes: resultado, suspeitas, corrigidas, confirmadas };
 }
 
 /** Filtra viagens que precisam de alerta (abaixo do alvo e não avisadas ou preço menor). */
@@ -497,7 +619,6 @@ async function gravarAlertasNoSupabase(viagens) {
 
   const supabase = createClient(url, chave);
   const linhas = viagens.map(o => ({
-    chave: chaveViagem(o),
     origem: o.origem,
     destino: o.destino,
     data_ida: o.dataIda,
@@ -644,6 +765,13 @@ for (let i = 0; i < combinacoes.length; i++) {
   }
 }
 
+let sanidade = { suspeitas: 0, corrigidas: 0, confirmadas: 0 };
+if (todasOpcoes.length > 0 && !modoTeste) {
+  const { opcoes: revalidadas, ...contagens } = await revalidarQuedasSuspeitas(todasOpcoes);
+  todasOpcoes.splice(0, todasOpcoes.length, ...revalidadas);
+  sanidade = contagens;
+}
+
 const tempoTotalSeg = ((Date.now() - inicio) / 1000).toFixed(1);
 
 imprimirTabelaTop10(todasOpcoes);
@@ -654,6 +782,9 @@ console.log(`  Buscas com falha:   ${buscasFalha}`);
 console.log(`  Tempo total:        ${tempoTotalSeg}s`);
 console.log(`  Opções válidas:     ${todasOpcoes.length}`);
 console.log(`  Opções descartadas por preço inválido: ${opcoesDescartadasTotal}`);
+console.log(
+  `  Quedas suspeitas: ${sanidade.suspeitas} (${sanidade.confirmadas} confirmadas, ${sanidade.corrigidas} corrigidas/descartadas)`,
+);
 if (interrompidoPorFalhas) {
   console.log(`  ⚠ Varredura interrompida por falhas seguidas`);
 }
@@ -668,6 +799,7 @@ const payload = {
     tempoTotalSegundos: Number(tempoTotalSeg),
     totalOpcoes: todasOpcoes.length,
     opcoesDescartadas: opcoesDescartadasTotal,
+    sanidade,
   },
   erros,
   opcoes: todasOpcoes,
