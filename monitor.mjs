@@ -58,12 +58,15 @@ if (destinoOverride) {
 }
 
 const PAUSA_RETRY_MS = 10_000;
+const PAUSA_BLOQUEIO_MS = 3 * 60_000;
+const MAX_PAUSAS_BLOQUEIO = 2;
 
 let buscasOk = 0;
 let buscasFalha = 0;
 let opcoesDescartadasTotal = 0;
 let falhasSeguidas = 0;
 let interrompidoPorFalhas = false;
+let pausasPorBloqueio = 0;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -752,7 +755,20 @@ for (let i = 0; i < combinacoes.length; i++) {
     erros.push(msg);
     console.log(`  → ERRO (seguindo): ${msg.erro}`);
     
-    // Interromper se 8 falhas seguidas
+    // 8 falhas seguidas: pausa e refaz as datas que falharam; após MAX_PAUSAS_BLOQUEIO, interrompe
+    if (falhasSeguidas >= 8 && pausasPorBloqueio < MAX_PAUSAS_BLOQUEIO) {
+      pausasPorBloqueio += 1;
+      console.log(
+        `\n⏸ ${falhasSeguidas} falhas seguidas (provável bloqueio). Pausa ${pausasPorBloqueio}/${MAX_PAUSAS_BLOQUEIO} ` +
+          `de ${PAUSA_BLOQUEIO_MS / 60_000} min e refazendo essas ${falhasSeguidas} datas...\n`,
+      );
+      await sleep(PAUSA_BLOQUEIO_MS);
+      erros.splice(-falhasSeguidas);
+      buscasFalha -= falhasSeguidas;
+      i -= falhasSeguidas;
+      falhasSeguidas = 0;
+      continue;
+    }
     if (falhasSeguidas >= 8) {
       interrompidoPorFalhas = true;
       console.log(`\n⛔ Interrompendo varredura: ${falhasSeguidas} falhas seguidas detectadas.`);
