@@ -1,4 +1,4 @@
 {
   "regions": ["gru1"],
-  "crons": [{ "path": "/api/disparar-monitor", "schedule": "17 11 * * *" }]
+  "crons": [{ "path": "/api/disparar-monitor", "schedule": "17 9 * * *" }]
 }
